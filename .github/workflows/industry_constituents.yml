@@ -2,7 +2,8 @@ name: Industry Constituents Data Update
 
 on:
   schedule:
-    - cron: '22 7 * * 3'
+    - cron: '15 0 * * *'    # 北京时间每天 08:15
+    - cron: '35 7 * * *'    # 北京时间每天 15:35
   workflow_dispatch:
 
 jobs:
@@ -31,6 +32,8 @@ jobs:
           python industry_constituents.py
 
       - name: Commit and push changes
+        env:
+          TZ: 'Asia/Shanghai'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
@@ -43,3 +46,4 @@ jobs:
           else
             echo "No changes in data/ directory, skipping commit"
           fi
+
