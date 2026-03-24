@@ -68,6 +68,18 @@ jobs:
           mkdir -p extracted
           tar -xzf package.tar.gz -C extracted
 
+      - name: Sync README
+        run: |
+          PACKAGE_ROOT=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n 1)
+
+          if [ -z "$PACKAGE_ROOT" ] || [ ! -f "$PACKAGE_ROOT/README.md" ]; then
+            echo "❌ README.md not found in extracted package root!"
+            exit 1
+          fi
+
+          echo "Syncing README from: $PACKAGE_ROOT/README.md"
+          cp "$PACKAGE_ROOT/README.md" README.md
+
       # ✅ 清空 src
       - name: Clean src directory
         run: |
@@ -123,3 +135,4 @@ jobs:
             git commit -m "Auto sync thsdk ${VERSION}"
             git push
           fi
+
