@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -41,6 +42,7 @@ __all__ = [
 
 FieldOption = tuple[str, str]
 Executor = Callable[[Any, dict[str, Any]], Any]
+ExecutionResult = tuple[dict[str, Any], dict[str, Any], dict[str, float]]
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,80 @@ class MethodSpec:
             "example": self.example,
             "fields": [field.to_schema() for field in self.fields],
         }
+
+
+class THSConnectionError(RuntimeError):
+    def __init__(self, payload: dict[str, Any]):
+        super().__init__(str(payload.get("error", "THS 连接失败")))
+        self.payload = payload
+
+
+class THSSingletonConnection:
+    """Serialize web queries through one shared THS client and keep the TCP session alive."""
+
+    def __init__(self, ths_factory: Callable[[], Any] = THS):
+        self._ths_factory = ths_factory
+        self._ths: Any | None = None
+        self._lock = threading.RLock()
+
+    def execute(self, query: Callable[[Any], ExecutionResult]) -> ExecutionResult:
+        wait_started_at = time.perf_counter()
+        with self._lock:
+            lock_wait_ms = round((time.perf_counter() - wait_started_at) * 1000, 2)
+            raw_payload, request_view, timing = self._execute_locked(query, allow_retry=True)
+            timing = dict(timing)
+            timing["lock_wait_ms"] = lock_wait_ms
+            return raw_payload, request_view, timing
+
+    def close(self) -> None:
+        with self._lock:
+            self._reset_locked()
+
+    def _execute_locked(
+        self, query: Callable[[Any], ExecutionResult], allow_retry: bool
+    ) -> ExecutionResult:
+        ths, connect_duration_ms = self._ensure_connected_locked()
+        try:
+            raw_payload, request_view, timing = query(ths)
+        except Exception as exc:
+            if allow_retry and _is_connection_error(str(exc)):
+                self._reset_locked()
+                return self._execute_locked(query, allow_retry=False)
+            raise
+
+        if allow_retry and _should_reconnect(raw_payload):
+            self._reset_locked()
+            return self._execute_locked(query, allow_retry=False)
+
+        if connect_duration_ms > 0:
+            timing = dict(timing)
+            timing["connect_duration_ms"] = connect_duration_ms
+        return raw_payload, request_view, timing
+
+    def _ensure_connected_locked(self) -> tuple[Any, float]:
+        connect_duration_ms = 0.0
+        if self._ths is None:
+            self._ths = self._ths_factory()
+
+        if not getattr(self._ths, "_initialized", False):
+            connect_started_at = time.perf_counter()
+            connect_response = self._ths.connect()
+            connect_duration_ms = round((time.perf_counter() - connect_started_at) * 1000, 2)
+            if not connect_response.success:
+                payload = connect_response.to_dict()
+                self._reset_locked()
+                raise THSConnectionError(payload)
+        return self._ths, connect_duration_ms
+
+    def _reset_locked(self) -> None:
+        ths = self._ths
+        self._ths = None
+        if ths is None:
+            return
+        try:
+            ths.disconnect()
+        except Exception:
+            pass
 
 
 def _select_options(values: list[str], labels: Optional[dict[str, str]] = None) -> tuple[FieldOption, ...]:
@@ -205,7 +281,6 @@ MARKET_DATA_AUTO_LOADERS = {
     "market_data_index": (("index_list", {}),),
     "market_data_block": (("ths_industry", {}), ("ths_concept", {})),
 }
-MARKET_DATA_BATCH_SIZE = 60
 LIST_DATA_METHODS = {
     "ths_industry": {
         "label": "行业板块列表",
@@ -826,10 +901,6 @@ def _response_to_dict(result: Any) -> dict[str, Any]:
     }
 
 
-def _iter_chunks(values: list[str], size: int) -> list[list[str]]:
-    return [values[index : index + size] for index in range(0, len(values), size)]
-
-
 def _pick_code_key(rows: list[dict[str, Any]]) -> str | None:
     for key in ("代码", "THSCODE", "Code", "code", "link_code", "block_code"):
         if any(key in row for row in rows):
@@ -845,15 +916,18 @@ def _extract_rows(data: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _load_market_data_codes(ths: Any, method_name: str) -> tuple[list[str], list[str], dict[str, Any]]:
+def _load_market_data_codes(ths: Any, method_name: str) -> tuple[list[str], list[str], dict[str, Any], float]:
     loader_specs = MARKET_DATA_AUTO_LOADERS.get(method_name, ())
     all_codes: list[str] = []
     errors: list[str] = []
     loader_summary: list[dict[str, Any]] = []
     seen: set[str] = set()
+    sdk_duration_ms = 0.0
 
     for loader_name, loader_kwargs in loader_specs:
+        started_at = time.perf_counter()
         response = getattr(ths, loader_name)(**loader_kwargs)
+        sdk_duration_ms += (time.perf_counter() - started_at) * 1000
         if not response:
             errors.append(f"{loader_name}: {response.error}")
             continue
@@ -883,14 +957,14 @@ def _load_market_data_codes(ths: Any, method_name: str) -> tuple[list[str], list
         "loaders": loader_summary,
         "code_count": len(all_codes),
     }
-    return all_codes, errors, meta
+    return all_codes, errors, meta, round(sdk_duration_ms, 2)
 
 
-def _execute_full_market_query(ths: Any, method_name: str, request_values: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _execute_full_market_query(ths: Any, method_name: str, request_values: dict[str, Any]) -> ExecutionResult:
     config = MARKET_DATA_METHODS[method_name]
     code_field = config["code_field"]
     query_key = request_values.get("query_key", next(iter(config["query_config"].keys())))
-    codes, loader_errors, load_meta = _load_market_data_codes(ths, method_name)
+    codes, loader_errors, load_meta, sdk_duration_ms = _load_market_data_codes(ths, method_name)
     request_view = dict(request_values)
     request_view.setdefault(code_field, "")
     request_view["load_mode"] = "all_market"
@@ -904,9 +978,10 @@ def _execute_full_market_query(ths: Any, method_name: str, request_values: dict[
                 "success": False,
                 "error": error_text,
                 "data": [],
-                "extra": {"load_meta": load_meta, "batch_errors": loader_errors},
+                "extra": {"load_meta": load_meta, "market_errors": loader_errors},
             },
             request_view,
+            {"sdk_duration_ms": sdk_duration_ms},
         )
 
     grouped_codes: dict[str, list[str]] = {}
@@ -917,41 +992,41 @@ def _execute_full_market_query(ths: Any, method_name: str, request_values: dict[
 
     all_rows: list[dict[str, Any]] = []
     all_extra_rows: list[dict[str, Any]] = []
-    batch_errors = list(loader_errors)
-    batch_total = 0
-    success_batches = 0
+    market_errors = list(loader_errors)
+    market_total = 0
+    success_markets = 0
 
     for market, market_codes in grouped_codes.items():
-        for chunk in _iter_chunks(market_codes, MARKET_DATA_BATCH_SIZE):
-            batch_total += 1
-            response = getattr(ths, method_name)(chunk, query_key=query_key)
-            raw = _response_to_dict(response)
-            if not raw.get("success", False):
-                batch_errors.append(f"{market}: {raw.get('error', '查询失败')}")
-                continue
+        market_total += 1
+        started_at = time.perf_counter()
+        response = getattr(ths, method_name)(market_codes, query_key=query_key)
+        sdk_duration_ms += (time.perf_counter() - started_at) * 1000
+        raw = _response_to_dict(response)
+        if not raw.get("success", False):
+            market_errors.append(f"{market}: {raw.get('error', '查询失败')}")
+            continue
 
-            success_batches += 1
-            all_rows.extend(_extract_rows(raw.get("data")))
-            extra = raw.get("extra")
-            if isinstance(extra, dict) and extra:
-                all_extra_rows.append({"market": market, "batch_size": len(chunk), **extra})
-            elif extra not in ({}, None, ""):
-                all_extra_rows.append({"market": market, "batch_size": len(chunk), "value": extra})
+        success_markets += 1
+        all_rows.extend(_extract_rows(raw.get("data")))
+        extra = raw.get("extra")
+        if isinstance(extra, dict) and extra:
+            all_extra_rows.append({"market": market, "code_count": len(market_codes), **extra})
+        elif extra not in ({}, None, ""):
+            all_extra_rows.append({"market": market, "code_count": len(market_codes), "value": extra})
 
     merged_extra = {
         "load_meta": load_meta,
-        "batch_size": MARKET_DATA_BATCH_SIZE,
         "group_count": len(grouped_codes),
-        "batch_total": batch_total,
-        "success_batches": success_batches,
+        "market_total": market_total,
+        "success_markets": success_markets,
     }
     if all_extra_rows:
-        merged_extra["batch_extra"] = all_extra_rows
-    if batch_errors:
-        merged_extra["batch_errors"] = batch_errors
+        merged_extra["market_extra"] = all_extra_rows
+    if market_errors:
+        merged_extra["market_errors"] = market_errors
 
-    success = success_batches > 0 and not batch_errors
-    error_text = "; ".join(batch_errors)
+    success = success_markets > 0 and not market_errors
+    error_text = "; ".join(market_errors)
     return (
         {
             "success": success,
@@ -960,7 +1035,44 @@ def _execute_full_market_query(ths: Any, method_name: str, request_values: dict[
             "extra": merged_extra,
         },
         request_view,
+        {"sdk_duration_ms": round(sdk_duration_ms, 2)},
     )
+
+
+def _is_connection_error(message: str) -> bool:
+    lowered = str(message).strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "未登录",
+        "连接",
+        "断开",
+        "disconnect",
+        "socket",
+        "tcp",
+        "broken pipe",
+        "connection reset",
+        "reset by peer",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _should_reconnect(raw_payload: dict[str, Any]) -> bool:
+    if raw_payload.get("success", False):
+        return False
+    return _is_connection_error(str(raw_payload.get("error", "")))
+
+
+def _execute_query_with_ths(
+    ths: Any, spec: MethodSpec, method_name: str, normalized_request: dict[str, Any]
+) -> ExecutionResult:
+    request_view = dict(normalized_request)
+    if method_name in MARKET_DATA_METHODS and MARKET_DATA_METHODS[method_name]["code_field"] not in normalized_request:
+        return _execute_full_market_query(ths, method_name, normalized_request)
+    started_at = time.perf_counter()
+    raw_payload = _response_to_dict(spec.executor(ths, normalized_request))
+    sdk_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    return raw_payload, request_view, {"sdk_duration_ms": sdk_duration_ms}
 
 
 def build_schema_payload() -> dict[str, Any]:
@@ -974,7 +1086,11 @@ def build_schema_payload() -> dict[str, Any]:
     }
 
 
-def execute_web_query(payload: dict[str, Any], ths_factory: Callable[[], Any] = THS) -> dict[str, Any]:
+def execute_web_query(
+    payload: dict[str, Any],
+    ths_factory: Callable[[], Any] = THS,
+    ths_connection: THSSingletonConnection | None = None,
+) -> dict[str, Any]:
     method_name = str(payload.get("method", "")).strip()
     if not method_name:
         raise ValueError("缺少 method 参数")
@@ -987,17 +1103,22 @@ def execute_web_query(payload: dict[str, Any], ths_factory: Callable[[], Any] = 
     request_view = dict(normalized_request)
     started_at = time.perf_counter()
     ths = None
+    timing: dict[str, float] = {}
 
     try:
-        ths = ths_factory()
-        connect_response = ths.connect()
-        if not connect_response.success:
-            raw_payload = connect_response.to_dict()
+        if ths_connection is not None:
+            raw_payload, request_view, timing = ths_connection.execute(
+                lambda connected_ths: _execute_query_with_ths(connected_ths, spec, method_name, normalized_request)
+            )
         else:
-            if method_name in MARKET_DATA_METHODS and MARKET_DATA_METHODS[method_name]["code_field"] not in normalized_request:
-                raw_payload, request_view = _execute_full_market_query(ths, method_name, normalized_request)
+            ths = ths_factory()
+            connect_response = ths.connect()
+            if not connect_response.success:
+                raw_payload = connect_response.to_dict()
             else:
-                raw_payload = _response_to_dict(spec.executor(ths, normalized_request))
+                raw_payload, request_view, timing = _execute_query_with_ths(ths, spec, method_name, normalized_request)
+    except THSConnectionError as exc:
+        raw_payload = exc.payload
     except Exception as exc:
         raw_payload = {
             "success": False,
@@ -1007,7 +1128,9 @@ def execute_web_query(payload: dict[str, Any], ths_factory: Callable[[], Any] = 
         }
     finally:
         duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-        if ths is not None:
+        timing = dict(timing)
+        timing["server_duration_ms"] = duration_ms
+        if ths is not None and ths_connection is None:
             try:
                 ths.disconnect()
             except Exception:
@@ -1022,6 +1145,7 @@ def execute_web_query(payload: dict[str, Any], ths_factory: Callable[[], Any] = 
         "label": spec.label,
         "request": _serialize_value(request_view),
         "duration_ms": duration_ms,
+        "timing": timing,
         "result": result_block,
         "extra": extra_block,
         "raw": raw_payload,
@@ -1438,6 +1562,50 @@ INDEX_HTML = """<!doctype html>
       border-top: 0;
     }
 
+    .data-block-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .data-block-head h3 {
+      margin: 0;
+    }
+
+    .block-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .inline-button {
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      background: rgba(255, 251, 243, 0.72);
+      color: var(--ink);
+      cursor: pointer;
+      font: 600 11px/1 var(--mono);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .inline-button:hover {
+      transform: translateY(-1px);
+    }
+
+    .block-note {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: rgba(255, 251, 243, 0.72);
+    }
+
     .table-shell {
       overflow: auto;
       border: 1px solid var(--line);
@@ -1579,6 +1747,12 @@ INDEX_HTML = """<!doctype html>
       .ghost-button {
         width: 100%;
       }
+
+      .block-note,
+      .data-block-head {
+        flex-direction: column;
+        align-items: flex-start;
+      }
     }
   </style>
 </head>
@@ -1615,7 +1789,7 @@ INDEX_HTML = """<!doctype html>
       <section class="sidebar-block">
         <h2>使用说明</h2>
         <ul class="note-list">
-          <li>后端每次请求都会独立连接 THS，避免多个页面请求复用同一状态。</li>
+          <li>后端会复用同一个 THS 连接，并在掉线后自动重连一次。</li>
           <li>优先读取 <code>THS_USERNAME</code> / <code>THS_PASSWORD</code> / <code>THS_MAC</code> 环境变量。</li>
           <li>市场类批量查询要求同一请求中的代码属于同一市场。</li>
         </ul>
@@ -1652,14 +1826,10 @@ INDEX_HTML = """<!doctype html>
         <div class="result-toolbar">
           <div>
             <div class="result-headline">原始 JSON</div>
-            <p class="meta-copy">保留成功标记、错误消息、原始 data 和 extra，便于核对 SDK 层返回。</p>
+            <p class="meta-copy">默认折叠，展开时才生成格式化 JSON，避免大结果阻塞页面。</p>
           </div>
         </div>
-        <div class="raw-body">
-          <div class="data-block">
-            <pre id="raw-json">{}</pre>
-          </div>
-        </div>
+        <div class="raw-body" id="raw-body"></div>
       </section>
     </section>
   </main>
@@ -1678,11 +1848,12 @@ INDEX_HTML = """<!doctype html>
     const resultBody = document.getElementById("result-body");
     const resultSummary = document.getElementById("result-summary");
     const statusBadge = document.getElementById("status-badge");
-    const rawJson = document.getElementById("raw-json");
+    const rawBody = document.getElementById("raw-body");
     const presetList = document.getElementById("preset-list");
     const metaStrip = document.getElementById("meta-strip");
     const presetButtons = new Map();
     const presetByMethod = new Map(APP_SCHEMA.presets.map((preset) => [preset.method, preset]));
+    const DEFAULT_VISIBLE_ROWS = 20;
     const SOURCE_TO_DETAIL_METHOD = {
       stock_cn_lists: "market_data_cn",
       stock_us_lists: "market_data_us",
@@ -1701,6 +1872,15 @@ INDEX_HTML = """<!doctype html>
       nasdaq_lists: "market_data_us",
     };
     let currentPayload = null;
+    let currentViewState = createDefaultViewState();
+
+    function createDefaultViewState() {
+      return {
+        expandedBlocks: new Set(),
+        expandedSections: new Set(),
+        rawExpanded: false,
+      };
+    }
 
     function escapeHtml(value) {
       return String(value)
@@ -1934,13 +2114,38 @@ INDEX_HTML = """<!doctype html>
       return data;
     }
 
+    function roundMs(value) {
+      if (!Number.isFinite(value)) {
+        return 0;
+      }
+      return Math.round(value * 100) / 100;
+    }
+
     function renderMeta(payload) {
       const rowCount = payload.result && typeof payload.result.row_count === "number" ? payload.result.row_count : 0;
+      const timing = payload.timing || {};
+      const clientTiming = payload.client_timing || {};
       const chips = [
         payload.label || payload.method,
         "Rows " + rowCount,
-        payload.duration_ms + " ms",
       ];
+      if (typeof timing.sdk_duration_ms === "number") {
+        chips.push("SDK " + timing.sdk_duration_ms + " ms");
+      }
+      if (typeof timing.server_duration_ms === "number") {
+        chips.push("Server " + timing.server_duration_ms + " ms");
+      } else if (typeof payload.duration_ms === "number") {
+        chips.push(payload.duration_ms + " ms");
+      }
+      if (typeof timing.lock_wait_ms === "number" && timing.lock_wait_ms >= 1) {
+        chips.push("Queue " + timing.lock_wait_ms + " ms");
+      }
+      if (typeof clientTiming.fetch_duration_ms === "number") {
+        chips.push("Fetch " + clientTiming.fetch_duration_ms + " ms");
+      }
+      if (typeof clientTiming.render_duration_ms === "number") {
+        chips.push("Render " + clientTiming.render_duration_ms + " ms");
+      }
       if (!payload.success) {
         chips.push("Error");
       }
@@ -1973,14 +2178,31 @@ INDEX_HTML = """<!doctype html>
       return { method, values };
     }
 
-    function renderTable(block, sourcePayload = null) {
+    function renderSectionButton(action, target, label) {
+      return (
+        '<button type="button" class="inline-button" data-action="' +
+        escapeHtml(action) +
+        '" data-target="' +
+        escapeHtml(target) +
+        '">' +
+        escapeHtml(label) +
+        "</button>"
+      );
+    }
+
+    function renderTable(block, sourcePayload = null, options = {}) {
       if (!block.columns || block.columns.length === 0) {
         return '<div class="helper-copy">接口返回为空，没有可展示的列。</div>';
       }
 
+      const blockKey = options.blockKey || "result";
+      const expanded = Boolean(options.expanded);
+      const rows = Array.isArray(block.rows) ? block.rows : [];
+      const totalRows = typeof block.row_count === "number" ? block.row_count : rows.length;
+      const visibleRows = expanded ? rows : rows.slice(0, DEFAULT_VISIBLE_ROWS);
       const codeColumn = sourcePayload ? preferredCodeColumn(block) : "";
       const head = block.columns.map((column) => "<th>" + escapeHtml(column) + "</th>").join("");
-      const body = block.rows.map((row, rowIndex) => {
+      const body = visibleRows.map((row, rowIndex) => {
         const detailPayload = sourcePayload ? buildDetailPayload(sourcePayload, row) : null;
         const cells = block.columns.map((column) => {
           const cellValue = row[column];
@@ -1999,24 +2221,87 @@ INDEX_HTML = """<!doctype html>
         return "<tr>" + cells + "</tr>";
       }).join("");
 
-      return '<div class="table-shell"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
+      let note = "";
+      if (totalRows > DEFAULT_VISIBLE_ROWS) {
+        const button = expanded
+          ? renderSectionButton("collapse-block", blockKey, "仅看前 20 行")
+          : renderSectionButton("expand-block", blockKey, "显示全部");
+        note =
+          '<div class="block-note"><p class="helper-copy">当前仅渲染 ' +
+          escapeHtml(String(visibleRows.length)) +
+          " / " +
+          escapeHtml(String(totalRows)) +
+          ' 行，减少大表格阻塞。</p><div class="block-actions">' +
+          button +
+          "</div></div>";
+      }
+
+      return note + '<div class="table-shell"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
     }
 
-    function renderBlock(title, block, sourcePayload = null) {
+    function renderBlock(title, block, sourcePayload = null, options = {}) {
       if (!block || block.kind === "empty") {
         return "";
       }
 
-      if (block.kind === "text") {
-        return '<section class="data-block"><h3>' + escapeHtml(title) + '</h3><pre>' + escapeHtml(block.text || "") + '</pre></section>';
+      const sectionKey = options.sectionKey || "result";
+      const sectionExpanded = options.collapsible ? currentViewState.expandedSections.has(sectionKey) : true;
+      const actions = [];
+      if (options.collapsible) {
+        actions.push(
+          sectionExpanded
+            ? renderSectionButton("collapse-section", sectionKey, "收起")
+            : renderSectionButton("expand-section", sectionKey, "展开")
+        );
       }
 
-      return '<section class="data-block"><h3>' + escapeHtml(title) + '</h3>' + renderTable(block, sourcePayload) + "</section>";
+      let blockContent = '<p class="helper-copy">当前已折叠，展开后再渲染内容。</p>';
+      if (sectionExpanded) {
+        if (block.kind === "text") {
+          blockContent = "<pre>" + escapeHtml(block.text || "") + "</pre>";
+        } else {
+          blockContent = renderTable(block, sourcePayload, {
+            blockKey: sectionKey,
+            expanded: currentViewState.expandedBlocks.has(sectionKey),
+          });
+        }
+      }
+
+      return (
+        '<section class="data-block"><div class="data-block-head"><h3>' +
+        escapeHtml(title) +
+        '</h3><div class="block-actions">' +
+        actions.join("") +
+        "</div></div>" +
+        blockContent +
+        "</section>"
+      );
     }
 
-    function renderResult(payload) {
+    function renderRawPanel(payload) {
+      if (!currentViewState.rawExpanded) {
+        rawBody.innerHTML =
+          '<div class="data-block"><div class="data-block-head"><h3>原始 JSON</h3><div class="block-actions">' +
+          renderSectionButton("expand-raw", "raw", "展开") +
+          '</div></div><p class="helper-copy">默认不格式化大 JSON，点击展开后再生成内容。</p></div>';
+        return;
+      }
+
+      rawBody.innerHTML =
+        '<div class="data-block"><div class="data-block-head"><h3>原始 JSON</h3><div class="block-actions">' +
+        renderSectionButton("collapse-raw", "raw", "收起") +
+        "</div></div><pre>" +
+        escapeHtml(JSON.stringify(payload.raw, null, 2)) +
+        "</pre></div>";
+    }
+
+    function renderResult(payload, clientTiming = null, preserveViewState = false) {
+      const renderStartedAt = performance.now();
+      if (!preserveViewState) {
+        currentViewState = createDefaultViewState();
+      }
       currentPayload = payload;
-      renderMeta(payload);
+      payload.client_timing = clientTiming || payload.client_timing || {};
       statusBadge.textContent = payload.success ? "Success" : "Error";
       statusBadge.className = payload.success ? "status-badge" : "status-badge status-error";
       resultSummary.textContent = payload.error
@@ -2028,14 +2313,80 @@ INDEX_HTML = """<!doctype html>
           '<div class="error-state">' +
           escapeHtml(payload.error) +
           "</div>" +
-          renderBlock("返回数据", payload.result, payload) +
-          renderBlock("扩展字段", payload.extra);
+          renderBlock("返回数据", payload.result, payload, { sectionKey: "result" }) +
+          renderBlock("扩展字段", payload.extra, null, { sectionKey: "extra", collapsible: true });
       } else {
-        const body = renderBlock("返回数据", payload.result, payload) + renderBlock("扩展字段", payload.extra);
+        const body =
+          renderBlock("返回数据", payload.result, payload, { sectionKey: "result" }) +
+          renderBlock("扩展字段", payload.extra, null, { sectionKey: "extra", collapsible: true });
         resultBody.innerHTML = body || '<div class="empty-state">请求成功，但当前接口没有返回可展示的数据。</div>';
       }
 
-      rawJson.textContent = JSON.stringify(payload.raw, null, 2);
+      renderRawPanel(payload);
+      payload.client_timing.render_duration_ms = roundMs(performance.now() - renderStartedAt);
+      renderMeta(payload);
+    }
+
+    function rerenderCurrentPayload() {
+      if (!currentPayload) {
+        return;
+      }
+      renderResult(currentPayload, currentPayload.client_timing || {}, true);
+    }
+
+    function toggleBlockExpansion(blockKey, expanded) {
+      if (expanded) {
+        currentViewState.expandedBlocks.add(blockKey);
+      } else {
+        currentViewState.expandedBlocks.delete(blockKey);
+      }
+      rerenderCurrentPayload();
+    }
+
+    function toggleSection(sectionKey, expanded) {
+      if (expanded) {
+        currentViewState.expandedSections.add(sectionKey);
+      } else {
+        currentViewState.expandedSections.delete(sectionKey);
+      }
+      rerenderCurrentPayload();
+    }
+
+    function toggleRaw(expanded) {
+      currentViewState.rawExpanded = expanded;
+      rerenderCurrentPayload();
+    }
+
+    function handleResultAction(action, target) {
+      if (action === "expand-block") {
+        toggleBlockExpansion(target, true);
+        return true;
+      }
+      if (action === "collapse-block") {
+        toggleBlockExpansion(target, false);
+        return true;
+      }
+      if (action === "expand-section") {
+        toggleSection(target, true);
+        return true;
+      }
+      if (action === "collapse-section") {
+        toggleSection(target, false);
+        return true;
+      }
+      return false;
+    }
+
+    function handleRawAction(action) {
+      if (action === "expand-raw") {
+        toggleRaw(true);
+        return true;
+      }
+      if (action === "collapse-raw") {
+        toggleRaw(false);
+        return true;
+      }
+      return false;
     }
 
     async function submitQuery(forcedPayload = null) {
@@ -2047,13 +2398,20 @@ INDEX_HTML = """<!doctype html>
       resultSummary.textContent = "正在执行查询...";
 
       try {
+        const requestStartedAt = performance.now();
         const response = await fetch("/api/query", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
+        const responseReceivedAt = performance.now();
         const result = await response.json();
-        renderResult(result);
+        const payloadReadyAt = performance.now();
+        renderResult(result, {
+          fetch_duration_ms: roundMs(payloadReadyAt - requestStartedAt),
+          response_wait_ms: roundMs(responseReceivedAt - requestStartedAt),
+          json_parse_duration_ms: roundMs(payloadReadyAt - responseReceivedAt),
+        });
       } catch (error) {
         renderResult({
           success: false,
@@ -2062,6 +2420,7 @@ INDEX_HTML = """<!doctype html>
           label: currentMethodSchema().label,
           request: payload,
           duration_ms: 0,
+          timing: { server_duration_ms: 0 },
           result: { kind: "empty", columns: [], rows: [], row_count: 0 },
           extra: { kind: "empty", columns: [], rows: [], row_count: 0 },
           raw: {},
@@ -2082,6 +2441,14 @@ INDEX_HTML = """<!doctype html>
     });
     resetButton.addEventListener("click", () => renderFields());
     resultBody.addEventListener("click", (event) => {
+      const actionButton = event.target.closest("[data-action]");
+      if (actionButton) {
+        const handled = handleResultAction(actionButton.dataset.action || "", actionButton.dataset.target || "");
+        if (handled) {
+          return;
+        }
+      }
+
       const action = event.target.closest(".cell-action");
       if (!action || !currentPayload || !currentPayload.result || !Array.isArray(currentPayload.result.rows)) {
         return;
@@ -2097,12 +2464,20 @@ INDEX_HTML = """<!doctype html>
       applyMethodValues(detailPayload.method, detailPayload.values);
       submitQuery({ method: detailPayload.method, ...detailPayload.values });
     });
+    rawBody.addEventListener("click", (event) => {
+      const actionButton = event.target.closest("[data-action]");
+      if (!actionButton) {
+        return;
+      }
+      handleRawAction(actionButton.dataset.action || "");
+    });
 
     renderMethodOptions();
     renderPresets();
     methodSelect.value = "search_symbols";
     renderFields(APP_SCHEMA.presets[0] ? APP_SCHEMA.presets[0].values : {});
     syncPresetState();
+    renderRawPanel({ raw: {} });
   </script>
 </body>
 </html>
@@ -2118,6 +2493,11 @@ class THSWebQueryServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], ths_factory: Callable[[], Any] = THS):
         super().__init__(server_address, THSWebHandler)
         self.ths_factory = ths_factory
+        self.ths_connection = THSSingletonConnection(ths_factory)
+
+    def server_close(self) -> None:
+        self.ths_connection.close()
+        super().server_close()
 
 
 class THSWebHandler(BaseHTTPRequestHandler):
@@ -2155,7 +2535,11 @@ class THSWebHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = execute_web_query(payload, ths_factory=self.server.ths_factory)
+            result = execute_web_query(
+                payload,
+                ths_factory=self.server.ths_factory,
+                ths_connection=self.server.ths_connection,
+            )
         except ValueError as exc:
             self._send_json(
                 {
@@ -2170,10 +2554,30 @@ class THSWebHandler(BaseHTTPRequestHandler):
             )
             return
 
+        self._log_query_result(result)
         self._send_json(result)
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+    def _log_query_result(self, payload: dict[str, Any]) -> None:
+        timing = payload.get("timing", {})
+        row_count = payload.get("result", {}).get("row_count", 0)
+        parts = [
+            f"time={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"method={payload.get('method', '')}",
+            f"success={payload.get('success', False)}",
+            f"rows={row_count}",
+            f"sdk_ms={timing.get('sdk_duration_ms', 0)}",
+            f"server_ms={timing.get('server_duration_ms', payload.get('duration_ms', 0))}",
+        ]
+        lock_wait_ms = timing.get("lock_wait_ms")
+        if lock_wait_ms is not None:
+            parts.append(f"queue_ms={lock_wait_ms}")
+        error = str(payload.get("error", "")).strip()
+        if error:
+            parts.append(f"error={error}")
+        print("[THSDK web] " + " ".join(parts), flush=True)
 
     def _send_bytes(self, body: bytes, *, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         self.send_response(status)

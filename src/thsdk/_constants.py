@@ -68,7 +68,7 @@ def market_to_market_id(market: str) -> str:
 # 市场代码列表
 MARKETS = ['USHI', 'USHA', 'USHB', 'USHD', 'USHJ', 'USHP', 'USHT', 'USZI', 'USZA', 'USZB', 'USZD', 'USZJ', 'USZP',
            'USOO', 'UZOO', 'UNQQ', 'UNQS', 'UHKM', 'UHKG', 'USTI', 'UFXB', 'UEUA', 'UCFD', 'UCFS', 'UCFZ', 'UGFF',
-           'UIFF', 'UDEF','UNYN','UNYA']
+           'UIFF', 'UDEF', 'UNYN', 'UNYA', 'UNYC']
 
 BLOCK_MARKETS = ['URFI']
 
@@ -509,7 +509,6 @@ FieldNameMap = {
     32773: "ServerDelay",
     34056: "total_count",
 }
-
 
 GUEST_ACCOUNT_PREFIX = "thsguest_"
 

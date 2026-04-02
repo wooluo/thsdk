@@ -23,10 +23,13 @@ python3 -m thsdk.examples.webapp --host 127.0.0.1 --port 8765
 - 每个接口的必填参数都已预置默认值
 - 左侧快捷预设覆盖全部已接入接口
 - 已内置 `market_data_block`、`market_data_cn/us/hk/uk/bond/fund/future/forex/index` 这组市场数据查询接口
-- `market_data_xxx` 留空证券代码时，会自动先取对应市场列表，再按 `market` 分组分批查询并合并结果
+- `market_data_xxx` 留空证券代码时，会自动先取对应市场列表，再按 `market` 分组查询并合并结果
 - 列表结果里的代码列可直接点击，自动切换到对应 `market_data_xxx` 详情查询
 - `data` 和 `extra` 会自动转成表格或文本展示
-- 每次请求独立连接/断开 THS，便于本地调试
+- 服务进程内复用单个 THS TCP 连接，避免每次请求重复登录
+- 单例连接会自行维持会话，遇到未登录或连接异常时会自动断开并重连一次
+- 大表默认只渲染前 20 行，按需再展开，减少浏览器卡顿
+- `extra` 和原始 JSON 默认折叠，展开时才生成内容
 
 ## 截图案例
 
