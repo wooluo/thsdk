@@ -1,0 +1,102 @@
+name: Backfill Level2 Reply For Existing Issues
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 2 * * *'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Scan existing issues and comment if matched
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          gh issue list \
+            --repo "$REPO" \
+            --state all \
+            --limit 200 \
+            --json number,title,body,url | jq -c '.[]' | while read -r issue; do
+
+            number=$(echo "$issue" | jq -r '.number')
+            title=$(echo "$issue" | jq -r '.title // ""')
+            body=$(echo "$issue" | jq -r '.body // ""')
+            text="${title}"$'\n'"${body}"
+
+            matched=0
+
+            if echo "$text" | grep -Eiq '\blevel[[:space:]-]?2\b'; then
+              matched=1
+            elif echo "$text" | grep -Eiq '\bl2[[:space:]-]*数据\b'; then
+              matched=1
+            elif echo "$text" | grep -Eiq '\bl2[[:space:]-]*行情\b'; then
+              matched=1
+            elif echo "$text" | grep -iq '二档行情'; then
+              matched=1
+            elif echo "$text" | grep -iq '深度行情'; then
+              matched=1
+            fi
+
+            if [ "$matched" -ne 1 ]; then
+              echo "Issue #$number not matched, skip."
+              continue
+            fi
+
+            comments=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$REPO/issues/$number/comments?per_page=100")
+
+            already_replied=$(echo "$comments" | jq -r '
+              map(select(
+                (.body // "") | contains("当前项目**暂不支持 Level2 / L2 行情数据展示与订阅**")
+                or contains("THS 平台侧相关能力已做调整")
+                or contains("https://quant.10jqka.com.cn/")
+              )) | length
+            ')
+
+            if [ "$already_replied" != "0" ]; then
+              echo "Issue #$number already replied, skip."
+              continue
+            fi
+
+            cat > reply.txt <<'EOF'
+感谢反馈。
+
+当前项目**暂不支持 Level2 / L2 行情数据展示与订阅**。
+
+主要原因如下：
+1. **交易所展示限制**：不同交易所对 Level2 / 深度行情数据的展示、使用与分发范围有不同要求，当前项目暂不提供相关展示能力；
+2. **平台能力调整**：THS 平台侧相关能力已做调整，当前本项目中不再提供 Level2 / L2 行情数据服务；
+3. **服务入口区分**：如需使用 Level2 / L2 行情能力，请前往指定平台申请和使用对应服务，当前项目暂不承载该类能力。
+
+如需 Level2 / L2 相关能力，请使用：
+https://quant.10jqka.com.cn/
+
+当前项目暂不支持的范围包括：
+- Level2 / L2 行情展示
+- Level2 / L2 行情订阅
+- 个人用户侧深度行情数据接入
+
+如你的需求涉及基础行情、K 线、普通盘口或其他公开可用能力，欢迎补充具体场景，我们会继续协助确认。
+EOF
+
+            gh issue comment "$number" \
+              --repo "$REPO" \
+              --body-file reply.txt
+
+            echo "Comment added to issue #$number"
+
+            gh issue edit "$number" \
+              --repo "$REPO" \
+              --add-label "unsupported-level2" || true
+
+          done
